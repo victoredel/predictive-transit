@@ -1,0 +1,7 @@
+redis==5.0.4
+python-dotenv==1.0.1
+numpy==1.26.4
+pandas==2.2.2
+xgboost==2.0.3
+scikit-learn==1.4.2
+psutil==5.9.8

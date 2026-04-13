@@ -1,0 +1,127 @@
+# ============================================================
+# predictive-transit — Docker Compose Stack (4 servicios)
+# ============================================================
+# Arquitectura orientada a eventos con patrón CQRS:
+#
+#   redis        ← Broker de eventos + Cache de ETAs
+#   ingestion    ← Productor: MBTA GTFS-RT → bus_gps_stream (XADD)
+#   ai-engine    ← Escritor CQRS: XREAD stream → XGBoost → ETA cache
+#   routing-api  ← Lector CQRS: GET eta:{route}:{vehicle} → JSON (O(1))
+#
+# Flujo de datos:
+#   [MBTA Feed] → ingestion → Redis Stream → ai-engine → Redis Hash
+#                                                              ↓
+#                                              routing-api → [Cliente/App]
+# ============================================================
+
+services:
+
+  # ── 1. Redis — Broker de eventos y cache de ETAs ───────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: transit-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"   # Expuesto para inspección local (RedisInsight, redis-cli)
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfilename "transit.aof"
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - transit-net
+
+  # ── 2. Ingestion — Productor GTFS-RT (Strategy Pattern) ────────────────
+  ingestion:
+    build:
+      context: ./ingestion
+      dockerfile: Dockerfile
+    container_name: transit-ingestion
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      REDIS_URL: "redis://redis:6379"   # apunta al contenedor interno
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - transit-net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ── 3. AI Engine — Escritor CQRS (XGBoost Inference) ──────────────────
+  ai-engine:
+    build:
+      context: ./ai-engine
+      dockerfile: Dockerfile
+    container_name: transit-ai-engine
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      REDIS_URL: "redis://redis:6379"
+    depends_on:
+      redis:
+        condition: service_healthy
+      ingestion:
+        condition: service_started   # ingestion debe estar corriendo (no hay healthcheck propio)
+    networks:
+      - transit-net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ── 4. Routing API — Lector CQRS (FastAPI) ────────────────────────────
+  routing-api:
+    build:
+      context: ./routing-api
+      dockerfile: Dockerfile
+    container_name: transit-routing-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"   # Expuesto al host para el frontend / app móvil
+    env_file:
+      - .env
+    environment:
+      REDIS_URL: "redis://redis:6379"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - transit-net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# ── Volúmenes persistentes ───────────────────────────────────────────────
+volumes:
+  redis_data:
+    name: transit-redis-data
+
+# ── Red interna (los 3 servicios Python se ven entre sí por hostname) ────
+networks:
+  transit-net:
+    name: transit-network
+    driver: bridge

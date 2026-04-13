@@ -1,0 +1,5 @@
+aiohttp==3.9.5
+redis==5.0.4
+python-dotenv==1.0.1
+gtfs-realtime-bindings==1.0.0
+protobuf==4.25.3

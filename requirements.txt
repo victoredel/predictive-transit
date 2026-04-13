@@ -1,0 +1,18 @@
+# ============================================================
+# predictive-transit — Ingestion Service Dependencies
+# ============================================================
+
+# Async HTTP client para polling
+aiohttp==3.9.5
+
+# Async Redis client — incluye redis.asyncio
+redis==5.0.4
+
+# Carga de variables de entorno desde .env
+python-dotenv==1.0.1
+
+# Oficial GTFS-Realtime bindings
+gtfs-realtime-bindings==1.0.0
+
+# Runtime transitivo de Protobuf
+protobuf==4.25.3
