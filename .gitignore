@@ -1,3 +1,4 @@
 .env
 *.venv
-ai-engine/MBTA_Bus_Arrival_Departure_Times_2025
+ai-engine/datasets/
+requirements.zip

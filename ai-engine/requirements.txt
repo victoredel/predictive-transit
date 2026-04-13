@@ -1,7 +1,22 @@
+# ============================================================
+# MBTA Predictive Transit — AI Engine Dependencies
+# Validación Cross-Year (Out-of-Time): Train 2024 / Eval 2025
+# ============================================================
+
+# --- Core ML ---
+xgboost==2.1.3
+scikit-learn==1.5.2
+numpy==1.26.4
+pandas==2.2.3
+
+# --- Open-Meteo Historical & Forecast Weather API ---
+openmeteo-requests==1.3.0
+requests-cache==1.2.1
+retry-requests==2.0.0
+
+# --- Redis CQRS Worker ---
 redis==5.0.4
 python-dotenv==1.0.1
-numpy==1.26.4
-pandas==2.2.2
-xgboost==2.0.3
-scikit-learn==1.4.2
+
+# --- Observability & Utilities ---
 psutil==5.9.8
