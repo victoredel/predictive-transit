@@ -1,4 +1,4 @@
 .env
 *.venv
 ai-engine/datasets/
-requirements.zip
+transit.zip
