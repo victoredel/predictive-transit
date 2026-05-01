@@ -27,6 +27,10 @@ elif ACTIVE_DATASET == "sivas":
     TARGET = "delay_min"
     CATEGORICAL_FEATURES = ["line_id", "stop_id", "traffic_level", "weather_condition"]
     MODEL_NAME = "transit_xgboost_sivas.json"
+elif ACTIVE_DATASET == "istanbul":
+    TARGET = "travel_time_seconds"
+    CATEGORICAL_FEATURES = ["stop_id"]
+    MODEL_NAME = "transit_xgboost_istanbul.json"
 else:
     raise ValueError(f"Unsupported ACTIVE_DATASET: {ACTIVE_DATASET}")
 
