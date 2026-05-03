@@ -38,21 +38,21 @@ logging.basicConfig(
 logger = logging.getLogger("train_model")
 
 XGB_PARAMS = {
-    'max_depth': 6,
+    'max_depth': 8,           # Reduced from 12 — fewer nodes per tree cuts VRAM significantly
     'learning_rate': 0.1440,
     'subsample': 0.9724,
     'colsample_bytree': 0.9814,
     'min_child_weight': 15,
-    'n_estimators': 300,
+    'n_estimators': 800,
     'early_stopping_rounds': 40,
     'objective': 'reg:squarederror',
-    'tree_method': 'hist',
-    'max_bin': 128,
+    'tree_method': 'hist',    # GPU-accelerated histogram method
+    'max_bin': 128,           # Reduced from 256 — halves histogram memory on 16GB T4
     'enable_categorical': True,
     'random_state': 42,
     'eval_metric': 'rmse',
     'n_jobs': -1,
-    'device': 'cpu',
+    'device': 'cuda',
 }
 
 def ram_mb() -> float:
@@ -86,7 +86,7 @@ def main() -> None:
             # Use lower fraction or no sampling for Sivas-size if needed, 
             # but Boston logic was 30%
             if ACTIVE_DATASET == "boston":
-                chunk = chunk.sample(frac=0.30, random_state=42)
+                pass # No downsampling for Cloud training
             dfs.append(chunk)
             del chunk
             gc.collect()
@@ -95,11 +95,14 @@ def main() -> None:
     else:
         # Single file loading (Sivas/Istanbul)
         df = pd.read_parquet(PARQUET_IN)
-        
-        # Safety Subsampling for massive datasets
-        if len(df) > 500000:
-            logger.info("  ⚠️ Dataset exceeds 500K rows. Downsampling applied to prevent OOM...")
-            df = df.sample(n=500000, random_state=42)
+
+        # Strategic subsampling to fit within 16GB GPU VRAM budget
+        if len(df) > 15_000_000:
+            logger.warning(
+                "  ⚠️ Dataset truncated to 15M rows to fit into 16GB GPU VRAM. "
+                "Original size: %d rows.", len(df)
+            )
+            df = df.sample(n=15_000_000, random_state=42)
 
     # Ensure memory-efficient types
     for col in CATEGORICAL_FEATURES:

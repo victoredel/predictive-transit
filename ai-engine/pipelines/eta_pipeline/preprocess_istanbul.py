@@ -119,7 +119,6 @@ def main():
     # 1. Load Data
     try:
         logger.warning(f"Loading stop_times file from {stop_times_path}...")
-        logger.info("Capped read at 1M rows to allow for 10-stop expansion without OOM.")
         load_start_time = time.time()
         
         stop_times_dtypes = {
@@ -131,8 +130,7 @@ def main():
             stop_times_path, 
             sep=',', 
             usecols=['trip_id', 'stop_id', 'stop_sequence', 'arrival_time'],
-            dtype=stop_times_dtypes,
-            nrows=500000
+            dtype=stop_times_dtypes
         )
         
         load_duration = time.time() - load_start_time
