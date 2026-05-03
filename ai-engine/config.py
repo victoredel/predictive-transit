@@ -22,15 +22,15 @@ MODELS_DIR.mkdir(parents=True, exist_ok=True)
 if ACTIVE_DATASET == "boston":
     TARGET = "tiempo_viaje_segundos"
     CATEGORICAL_FEATURES = ["route_id", "direction_id", "stop_id_origen", "stop_id_destino"]
-    MODEL_NAME = "transit_xgboost_boston.json"
+    MODEL_NAME = "transit_xgboost_boston.ubj"
 elif ACTIVE_DATASET == "sivas":
     TARGET = "delay_min"
     CATEGORICAL_FEATURES = ["line_id", "stop_id", "traffic_level", "weather_condition"]
-    MODEL_NAME = "transit_xgboost_sivas.json"
+    MODEL_NAME = "transit_xgboost_sivas.ubj"
 elif ACTIVE_DATASET == "istanbul":
     TARGET = "travel_time_seconds"
     CATEGORICAL_FEATURES = ["stop_id"]
-    MODEL_NAME = "transit_xgboost_istanbul.json"
+    MODEL_NAME = "transit_xgboost_istanbul.ubj"
 else:
     raise ValueError(f"Unsupported ACTIVE_DATASET: {ACTIVE_DATASET}")
 

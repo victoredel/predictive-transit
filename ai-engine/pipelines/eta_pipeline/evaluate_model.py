@@ -55,6 +55,7 @@ def load_model() -> xgb.XGBRegressor:
         logger.critical(f"❌ MODEL NOT FOUND: '{MODEL_PATH}'. Run train_model.py first.")
         sys.exit(1)
 
+    logger.info("  Loading binary model (.ubj) to preserve RAM...")
     model = xgb.XGBRegressor()
     model.load_model(str(MODEL_PATH))
     size_mb = MODEL_PATH.stat().st_size / (1024 ** 2)
