@@ -1,302 +1,474 @@
 """
-preprocess_istanbul.py — Production Preprocessing script for Istanbul
-=====================================================================
-Modular script to read stop times, interpolate, merge with stops,
-and prepare train/test splits in Parquet format.
+preprocess_istanbul.py — Leakage-Free Preprocessing for Istanbul GTFS-IETT
+===========================================================================
+Implements a strict chronological train/test split at the trip_id level to
+prevent data leakage. Applies a Chunking & Flush strategy (one Parquet per
+k-horizon) to keep RAM usage bounded on 30 GB Kaggle instances.
+
+Expanding Window historical average (tiempo_promedio_historico) is computed
+using only data with arrival_seconds strictly before the current row,
+mirroring the anti-leakage pattern from the Boston pipeline.
+
+Usage:
+  python preprocess_istanbul.py
 """
 
-import sys
-import os
-import time
+import gc
 import logging
+import os
+import pickle
+import shutil
+import sys
+import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 import psutil
-import requests_cache
 import openmeteo_requests
-from datetime import datetime, timedelta
+import requests_cache
 
-# Ensure ai-engine root is in sys.path
+# Ensure ai-engine root is importable
 ROOT = Path(__file__).parent.parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from config import (
-    RAW_DATA_DIR, 
-    PROCESSED_DATA_DIR, 
-    TARGET, 
-    CATEGORICAL_FEATURES, 
-    X_TRAIN_PARQUET, 
-    X_TEST_PARQUET
+    RAW_DATA_DIR,
+    PROCESSED_DATA_DIR,
+    TARGET,
+    CATEGORICAL_FEATURES,
+    X_TRAIN_PARQUET,
+    X_TEST_PARQUET,
+    MAX_LOOKAHEAD_STOPS,
 )
 
-# Logger Config
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
 logger = logging.getLogger("preprocess_istanbul")
 
-def ram_mb():
-    """Return the current memory usage of this process in MB."""
-    process = psutil.Process(os.getpid())
-    return process.memory_info().rss / (1024 * 1024)
+# Persists historical averages from train split so the test split can reuse them
+STATE_FILE = PROCESSED_DATA_DIR / "istanbul_historical_state.pkl"
 
-def log_step(msg):
-    """Print a visual separator, a log message, and the current RAM usage."""
-    logger.info("=" * 60)
-    logger.info(f"=== {msg} ===")
-    logger.info(f"=== Current RAM: {ram_mb():.2f} MB ===")
-    logger.info("=" * 60)
+# Max plausible travel time between stops in Istanbul (2 hours)
+MAX_TRAVEL_TIME_S = 7_200
 
-def calc_haversine_vectorized(lat1, lon1, lat2, lon2):
-    """Vectorized Haversine implementation for distance in meters."""
-    R = 6371000.0  # Earth radius in meters
+# Final feature columns written to every part_k.parquet
+FINAL_COLS = [
+    TARGET,
+    "hora_del_dia",
+    "temperature_2m",
+    "precipitation",
+    "stop_id",
+    "dest_stop_id",
+    "stop_lat",
+    "stop_lon",
+    "dest_lat",
+    "dest_lon",
+    "arrival_seconds",
+    "distancia_proyectada",
+    "velocidad_tramo_m_s",
+    "num_paradas_salto",
+    "tiempo_promedio_historico",
+]
+
+
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
+
+def ram_mb() -> float:
+    return psutil.Process(os.getpid()).memory_info().rss / 1024 ** 2
+
+
+def log_step(msg: str) -> None:
+    logger.info("=" * 70)
+    logger.info(msg)
+    logger.info("  RAM: %.0f MB", ram_mb())
+    logger.info("=" * 70)
+
+
+def calc_haversine_vectorized(lat1, lon1, lat2, lon2) -> np.ndarray:
+    """Vectorized Haversine distance in meters."""
+    R = 6_371_000.0
     phi1, phi2 = np.radians(lat1), np.radians(lat2)
     dphi = np.radians(lat2 - lat1)
     dlambda = np.radians(lon2 - lon1)
-    
-    a = np.sin(dphi / 2.0)**2 + np.cos(phi1) * np.cos(phi2) * np.sin(dlambda / 2.0)**2
+    a = np.sin(dphi / 2.0) ** 2 + np.cos(phi1) * np.cos(phi2) * np.sin(dlambda / 2.0) ** 2
     c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
     return (R * c).astype("float32")
 
-def fetch_istanbul_weather():
-    """Fetch historical weather for Istanbul (Open-Meteo)."""
-    # Coordinates for Istanbul
+
+def parse_time_string(time_str):
+    """Convert HH:MM:SS string (including >24h) to pd.Timedelta."""
+    if pd.isna(time_str) or time_str == "":
+        return pd.NaT
+    try:
+        h, m, s = map(int, str(time_str).strip().split(":"))
+        return pd.Timedelta(hours=h, minutes=m, seconds=s)
+    except Exception:
+        return pd.NaT
+
+
+def clean_coord(val) -> float:
+    """Normalize coordinate strings like '410082' → 41.0082."""
+    if pd.isna(val):
+        return np.nan
+    s = str(val)
+    digits = "".join(filter(str.isdigit, s))
+    if len(digits) < 2:
+        return np.nan
+    try:
+        return float(digits[:2] + "." + digits[2:])
+    except Exception:
+        return np.nan
+
+
+# ---------------------------------------------------------------------------
+# Data Loading
+# ---------------------------------------------------------------------------
+
+def fetch_istanbul_weather() -> pd.DataFrame:
+    """Fetch historical hourly weather for Istanbul via Open-Meteo archive."""
     ISTANBUL_LAT = 41.0082
     ISTANBUL_LON = 28.9784
-    
-    cache_session = requests_cache.CachedSession('.weather_cache_istanbul', expire_after=-1)
+    cache_session = requests_cache.CachedSession(".weather_cache_istanbul", expire_after=-1)
     om = openmeteo_requests.Client(session=cache_session)
-
-    # Simulate a date (7 days ago) to get historical data
-    target_date = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
-    
+    target_date = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
     params = {
         "latitude": ISTANBUL_LAT,
         "longitude": ISTANBUL_LON,
         "start_date": target_date,
         "end_date": target_date,
-        "hourly": ["temperature_2m", "precipitation"]
+        "hourly": ["temperature_2m", "precipitation"],
     }
-    
     try:
-        logger.info(f"Fetching weather for Istanbul on {target_date}...")
-        responses = om.weather_api("https://archive-api.open-meteo.com/v1/archive", params=params)
-        response = responses[0]
-        hourly = response.Hourly()
-        
-        # Extract hourly data
-        temp = hourly.Variables(0).ValuesAsNumpy()
+        logger.info("  Fetching weather for Istanbul on %s...", target_date)
+        resp = om.weather_api(
+            "https://archive-api.open-meteo.com/v1/archive", params=params
+        )[0]
+        hourly = resp.Hourly()
+        temps  = hourly.Variables(0).ValuesAsNumpy()
         precip = hourly.Variables(1).ValuesAsNumpy()
-        
-        weather_df = pd.DataFrame({
-            "hora_del_dia": np.arange(len(temp)),
-            "temperature_2m": temp,
-            "precipitation": precip
+        return pd.DataFrame({
+            "hora_del_dia":  np.arange(len(temps), dtype="int8"),
+            "temperature_2m": temps.astype("float32"),
+            "precipitation":  precip.astype("float32"),
         })
-        return weather_df
-    except Exception as e:
-        logger.error(f"Failed to fetch weather: {e}")
+    except Exception as exc:
+        logger.error("  Failed to fetch weather: %s. Using zeros.", exc)
         return pd.DataFrame()
 
-def parse_time_string(time_str):
-    if pd.isna(time_str) or time_str == '':
-        return pd.NaT
-    try:
-        hours, minutes, seconds = map(int, str(time_str).strip().split(':'))
-        return pd.Timedelta(hours=hours, minutes=minutes, seconds=seconds)
-    except Exception:
-        return pd.NaT
 
-def main():
-    script_start_time = time.time()
-    log_step("Starting Istanbul Data Preprocessing")
-
-    # Define paths based on RAW_DATA_DIR
+def load_and_prepare_base() -> pd.DataFrame:
+    """
+    Load stop_times.txt, interpolate missing arrival times, merge stop
+    coordinates, and clean coordinate columns.
+    Returns a single base DataFrame sorted by (trip_id, stop_sequence).
+    """
     stop_times_path = RAW_DATA_DIR / "gtfs_iett" / "stop_times" / "stop_times.txt"
-    stops_path = RAW_DATA_DIR / "gtfs_iett" / "stops.csv"
+    stops_path      = RAW_DATA_DIR / "gtfs_iett" / "stops.csv"
 
-    # 1. Load Data
-    try:
-        logger.warning(f"Loading stop_times file from {stop_times_path}...")
-        load_start_time = time.time()
-        
-        stop_times_dtypes = {
-            'trip_id': 'category',
-            'stop_id': 'int32',
-            'stop_sequence': 'int32'
-        }
-        df = pd.read_csv(
-            stop_times_path, 
-            sep=',', 
-            usecols=['trip_id', 'stop_id', 'stop_sequence', 'arrival_time'],
-            dtype=stop_times_dtypes
-        )
-        
-        load_duration = time.time() - load_start_time
-        logger.info(f"Successfully loaded stop_times.csv in {load_duration:.2f} seconds.")
-        logger.info(f"Current RAM after loading stop_times: {ram_mb():.2f} MB.")
-        
-        logger.info(f"Loading stops from {stops_path}...")
-        stops = pd.read_csv(stops_path, sep=';', usecols=['stop_id', 'stop_lat', 'stop_lon'])
-        stops['stop_id'] = stops['stop_id'].astype('int32')
-        
-    except FileNotFoundError as e:
-        logger.error(f"Missing raw CSV files: {e}")
-        return
+    log_step("STEP 1: Loading full stop_times.txt")
+    logger.warning("  Source: %s", stop_times_path)
 
-    # 2. Interpolation & Target Calculation Preparation
-    log_step("Parsing and Interpolating Times")
-    df['arrival_time_td'] = df['arrival_time'].apply(parse_time_string)
-    df = df.sort_values(by=['trip_id', 'stop_sequence']).reset_index(drop=True)
-    df['arrival_seconds'] = df['arrival_time_td'].dt.total_seconds()
-    
-    interp_start_time = time.time()
-    logger.info("Applying linear interpolation to missing arrival times...")
-    df['arrival_seconds'] = df.groupby('trip_id', observed=False)['arrival_seconds'].transform(lambda x: x.interpolate(method='linear'))
-    interp_duration = time.time() - interp_start_time
-    logger.info(f"Interpolation completed in {interp_duration:.2f} seconds.")
-    
-    # Drop rows that couldn't be interpolated
-    df = df.dropna(subset=['arrival_seconds'])
+    stop_times_dtypes = {
+        "trip_id":       "category",
+        "stop_id":       "int32",
+        "stop_sequence": "int32",
+    }
+    df = pd.read_csv(
+        stop_times_path,
+        sep=",",
+        usecols=["trip_id", "stop_id", "stop_sequence", "arrival_time"],
+        dtype=stop_times_dtypes,
+    )
+    logger.info("  Loaded %d rows | RAM: %.0f MB", len(df), ram_mb())
 
-    # 3. Merge with stops
-    log_step("Merging with Stops Data")
-    logger.info(f"Stop times shape: {df.shape}")
+    log_step("STEP 2: Parsing and Interpolating Arrival Times")
+    df["arrival_time_td"] = df["arrival_time"].apply(parse_time_string)
+    df.sort_values(["trip_id", "stop_sequence"], inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    df["arrival_seconds"] = df["arrival_time_td"].dt.total_seconds()
+    df["arrival_seconds"] = (
+        df.groupby("trip_id", observed=True)["arrival_seconds"]
+        .transform(lambda x: x.interpolate(method="linear"))
+    )
+    df.dropna(subset=["arrival_seconds"], inplace=True)
+    df.drop(columns=["arrival_time", "arrival_time_td"], inplace=True)
+    logger.info("  After interpolation: %d rows | RAM: %.0f MB", len(df), ram_mb())
+
+    log_step("STEP 3: Merging Stop Coordinates and Cleaning")
+    stops = pd.read_csv(stops_path, sep=";", usecols=["stop_id", "stop_lat", "stop_lon"])
+    stops["stop_id"] = stops["stop_id"].astype("int32")
     df = df.merge(stops, on="stop_id", how="left")
-    logger.info(f"Merged shape: {df.shape}")
+    del stops; gc.collect()
 
-    logger.info("Cleaning coordinate columns...")
-    def clean_coord(val):
-        if pd.isna(val): return np.nan
-        s = str(val)
-        digits = "".join(filter(str.isdigit, s))
-        if len(digits) < 2: return np.nan
-        try:
-            return float(digits[:2] + "." + digits[2:])
-        except:
-            return np.nan
+    for col in ["stop_lat", "stop_lon"]:
+        df[col] = df[col].apply(clean_coord).astype("float32")
+    df.dropna(subset=["stop_lat", "stop_lon"], inplace=True)
+    df["arrival_seconds"] = df["arrival_seconds"].astype("float32")
 
-    for col in ['stop_lat', 'stop_lon']:
-        if col in df.columns:
-            df[col] = df[col].apply(clean_coord)
-    
-    df = df.dropna(subset=['stop_lat', 'stop_lon'])
+    logger.info("  After merge + clean: %d rows | RAM: %.0f MB", len(df), ram_mb())
+    return df
 
-    # 4. Lookahead Expansion (Origin-Destination Pairs)
-    log_step("Lookahead Expansion: Generating O-D Pairs (k=1..10)")
-    MAX_LOOKAHEAD_STOPS = 10
-    chunks = []
-    
+
+# ---------------------------------------------------------------------------
+# Chronological Trip Split
+# ---------------------------------------------------------------------------
+
+def split_trips_chronologically(df: pd.DataFrame, train_frac: float = 0.80):
+    """
+    Divide trip_ids into train/test by the chronological order of their
+    earliest stop. The oldest train_frac of trips form the train set;
+    the newest (1 - train_frac) form the test set.
+
+    This guarantees no trip crosses the boundary, eliminating all temporal
+    data leakage between splits.
+    """
+    log_step("STEP 4: Chronological Train/Test Split (by trip_id)")
+
+    trip_start = (
+        df.groupby("trip_id", observed=True)["arrival_seconds"]
+        .min()
+        .sort_values()
+    )
+    n_trips   = len(trip_start)
+    split_idx = int(n_trips * train_frac)
+    train_trips = set(trip_start.iloc[:split_idx].index)
+    test_trips  = set(trip_start.iloc[split_idx:].index)
+
+    df_train = df[df["trip_id"].isin(train_trips)].reset_index(drop=True)
+    df_test  = df[df["trip_id"].isin(test_trips)].reset_index(drop=True)
+
+    logger.info(
+        "  Trips → Train: %d | Test: %d",
+        len(train_trips), len(test_trips),
+    )
+    logger.info(
+        "  Rows → Train: %d | Test: %d",
+        len(df_train), len(df_test),
+    )
+    return df_train, df_test
+
+
+# ---------------------------------------------------------------------------
+# Core: Chunking & Flush with Expanding Window
+# ---------------------------------------------------------------------------
+
+def run_split(
+    df_split: pd.DataFrame,
+    split_name: str,
+    out_dir: Path,
+    weather_df: pd.DataFrame,
+    historical_state: dict,
+) -> dict:
+    """
+    Generate O-D pairs for one split (train or test).
+
+    For each k-horizon:
+      1. Shift destination rows by k positions.
+      2. Apply trip-boundary and sequence-order masks.
+      3. Compute spatial features and the expanding-window historical average
+         (using only data with earlier arrival_seconds than the current row).
+      4. Save the resulting chunk as part_{k:02d}.parquet.
+      5. Delete chunk and call gc.collect() before the next iteration.
+
+    Returns the updated historical_state dictionary.
+    """
+    log_step(f"STEP 5: O-D Expansion + Flush — {split_name.upper()} (k=1..{MAX_LOOKAHEAD_STOPS})")
+
+    # Clean and create output directory
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Columns needed to look up destination rows after shift
+    dest_cols = ["trip_id", "stop_id", "stop_sequence", "arrival_seconds", "stop_lat", "stop_lon"]
+    df_dest = df_split[dest_cols].copy()
+
+    # Key for expanding window groupby (no route_id in GTFS-IETT)
+    pair_key = ["stop_id", "dest_stop_id"]
+    total_rows = 0
+
     for k in range(1, MAX_LOOKAHEAD_STOPS + 1):
-        df_shifted = df.shift(-k)
-        
-        # Mask: Same trip and sequence difference is k
-        mask_trip = (df['trip_id'] == df_shifted['trip_id'])
-        mask_seq = (df_shifted['stop_sequence'] > df['stop_sequence'])
-        
-        mask = mask_trip & mask_seq
-        
-        if mask.any():
-            chunk = df[mask].copy()
-            # Destinations
-            chunk['dest_stop_id'] = df_shifted.loc[mask, 'stop_id']
-            chunk['dest_lat'] = df_shifted.loc[mask, 'stop_lat']
-            chunk['dest_lon'] = df_shifted.loc[mask, 'stop_lon']
-            chunk['dest_arrival_seconds'] = df_shifted.loc[mask, 'arrival_seconds']
-            
-            # Target: travel time
-            chunk[TARGET] = chunk['dest_arrival_seconds'] - chunk['arrival_seconds']
-            
-            # Filter valid targets
-            chunk = chunk[chunk[TARGET] > 0].copy()
-            
-            # Spatial Features for this k-hop
-            chunk['distancia_proyectada'] = calc_haversine_vectorized(
-                chunk['stop_lat'], chunk['stop_lon'], 
-                chunk['dest_lat'], chunk['dest_lon']
-            )
-            
-            # Velocity
-            chunk['velocidad_tramo_m_s'] = chunk['distancia_proyectada'] / chunk[TARGET]
-            chunk['velocidad_tramo_m_s'] = chunk['velocidad_tramo_m_s'].replace([np.inf, -np.inf], np.nan).fillna(0)
-            
-            chunk['num_paradas_salto'] = k
-            
-            # Memory optimization: force float32 early
-            for col in ['stop_lat', 'stop_lon', 'arrival_seconds', 'dest_lat', 'dest_lon', 'dest_arrival_seconds', TARGET, 'distancia_proyectada', 'velocidad_tramo_m_s']:
-                if col in chunk.columns:
-                    chunk[col] = chunk[col].astype('float32')
-            
-            chunks.append(chunk)
+        df_shifted = df_dest.shift(-k)
+
+        mask_trip = (df_split["trip_id"] == df_shifted["trip_id"]).fillna(False)
+        mask_seq  = (df_shifted["stop_sequence"] > df_split["stop_sequence"]).fillna(False)
+        mask      = mask_trip & mask_seq
+
+        if not mask.any():
+            logger.info("  k=%-2d | No valid O-D pairs — skipping.", k)
             del df_shifted
-            import gc
             gc.collect()
-            
-    if not chunks:
-        logger.error("No O-D pairs generated!")
-        return
-        
-    df = pd.concat(chunks, ignore_index=True)
-    del chunks
+            continue
+
+        # --- Build chunk with origin + destination columns ---
+        chunk = df_split.loc[
+            mask, ["trip_id", "stop_id", "stop_sequence", "arrival_seconds", "stop_lat", "stop_lon"]
+        ].copy()
+
+        chunk["dest_stop_id"]         = df_shifted.loc[mask, "stop_id"].values
+        chunk["dest_lat"]             = df_shifted.loc[mask, "stop_lat"].values.astype("float32")
+        chunk["dest_lon"]             = df_shifted.loc[mask, "stop_lon"].values.astype("float32")
+        chunk["dest_arrival_seconds"] = df_shifted.loc[mask, "arrival_seconds"].values.astype("float32")
+        chunk[TARGET]                 = (chunk["dest_arrival_seconds"] - chunk["arrival_seconds"]).astype("float32")
+
+        del df_shifted
+        gc.collect()
+
+        # Filter implausible travel times
+        chunk = chunk[
+            (chunk[TARGET] > 0) & (chunk[TARGET] <= MAX_TRAVEL_TIME_S)
+        ].copy()
+
+        if len(chunk) == 0:
+            logger.info("  k=%-2d | Zero rows after target filter — skipping.", k)
+            del chunk
+            gc.collect()
+            continue
+
+        chunk["dest_stop_id"] = chunk["dest_stop_id"].astype("int32")
+
+        # Spatial features
+        chunk["distancia_proyectada"] = calc_haversine_vectorized(
+            chunk["stop_lat"], chunk["stop_lon"],
+            chunk["dest_lat"], chunk["dest_lon"],
+        )
+        chunk["velocidad_tramo_m_s"] = (
+            chunk["distancia_proyectada"] / chunk[TARGET]
+        ).replace([np.inf, -np.inf], np.nan).fillna(0.0).astype("float32")
+        chunk["num_paradas_salto"] = np.int8(k)
+
+        # ==============================================================
+        # EXPANDING WINDOW — tiempo_promedio_historico (Anti-Leakage)
+        # Sort by arrival_seconds ensures we only look at the past.
+        # cumsum - current_value gives the sum of all strictly prior rows
+        # within this chunk for the same (stop_id, dest_stop_id) pair.
+        # ==============================================================
+        chunk.sort_values("arrival_seconds", inplace=True)
+        chunk.reset_index(drop=True, inplace=True)
+
+        keys          = list(zip(chunk["stop_id"].astype(int), chunk["dest_stop_id"].astype(int)))
+        suma_previa   = np.array([historical_state.get(ky, (0.0, 0))[0] for ky in keys], dtype="float64")
+        conteo_previo = np.array([historical_state.get(ky, (0.0, 0))[1] for ky in keys], dtype="int64")
+
+        chunk["_t64"]  = chunk[TARGET].astype("float64")
+        suma_interna   = chunk.groupby(pair_key, observed=True)["_t64"].cumsum() - chunk["_t64"]
+        conteo_interna = chunk.groupby(pair_key, observed=True).cumcount()
+
+        total_sum   = suma_previa   + suma_interna.values
+        total_count = conteo_previo + conteo_interna.values
+
+        default_val = (chunk["distancia_proyectada"] / 5.0).values  # 5 m/s fallback speed
+        denom = np.where(total_count == 0, 1, total_count)
+        tph   = total_sum / denom
+        chunk["tiempo_promedio_historico"] = np.where(
+            total_count == 0, default_val, tph
+        ).astype("float32")
+        chunk.drop(columns=["_t64"], inplace=True)
+
+        # Update global state with this chunk's aggregates
+        aggs = (
+            chunk.groupby(pair_key, observed=True)[TARGET]
+            .agg(s="sum", c="count")
+            .reset_index()
+        )
+        for row in aggs.itertuples(index=False):
+            ky = (int(row.stop_id), int(row.dest_stop_id))
+            old_s, old_c = historical_state.get(ky, (0.0, 0))
+            historical_state[ky] = (old_s + row.s, old_c + row.c)
+        del aggs
+        # ==============================================================
+
+        # Temporal features
+        chunk["hora_del_dia"] = ((chunk["arrival_seconds"] // 3600) % 24).astype("int8")
+
+        # Weather merge by hour-of-day
+        if not weather_df.empty:
+            chunk = chunk.merge(weather_df, on="hora_del_dia", how="left")
+        else:
+            chunk["temperature_2m"] = np.float32(0.0)
+            chunk["precipitation"]  = np.float32(0.0)
+
+        chunk["temperature_2m"] = chunk["temperature_2m"].fillna(0.0).astype("float32")
+        chunk["precipitation"]  = chunk["precipitation"].fillna(0.0).astype("float32")
+
+        # Categorical encoding
+        for col in CATEGORICAL_FEATURES:
+            if col in chunk.columns:
+                chunk[col] = chunk[col].astype("category")
+
+        # Select and enforce final column set
+        out_cols = [c for c in FINAL_COLS if c in chunk.columns]
+        chunk = chunk[out_cols]
+
+        # --- FLUSH: save partition and free RAM ---
+        part_path = out_dir / f"part_{k:02d}.parquet"
+        chunk.to_parquet(part_path, index=False, compression="snappy")
+        total_rows += len(chunk)
+        logger.info(
+            "  k=%-2d | %8d rows → %s | RAM: %.0f MB",
+            k, len(chunk), part_path.name, ram_mb(),
+        )
+        del chunk
+        gc.collect()
+
+    del df_dest
     gc.collect()
-    logger.info(f"Expanded O-D pairs shape: {df.shape}")
 
-    # 5. Feature Engineering: Temporal & Weather
-    log_step("Feature Engineering: Temporal and Weather")
-    
-    # A. Temporal Features
-    df['hora_del_dia'] = ((df['arrival_seconds'] // 3600) % 24).astype('int8')
-    
-    # B. Weather Integration
+    logger.info(
+        "  ✅ %s done: %d total rows saved to %s/",
+        split_name.upper(), total_rows, out_dir.name,
+    )
+    return historical_state
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    script_start = time.time()
+    log_step("Istanbul Preprocessing — Leakage-Free + Chunking & Flush Architecture")
+
+    # 1. Load and prepare the full base dataframe
+    df = load_and_prepare_base()
+
+    # 2. Fetch weather once (reused by both train and test splits)
     weather_df = fetch_istanbul_weather()
-    if not weather_df.empty:
-        df = df.merge(weather_df, on="hora_del_dia", how="left")
-    else:
-        df['temperature_2m'] = 0.0
-        df['precipitation'] = 0.0
-        
-    # Final Cleanup
-    for col in ["distancia_proyectada", "temperature_2m", "precipitation", "velocidad_tramo_m_s"]:
-        if col in df.columns:
-            df[col] = df[col].fillna(0)
 
-    # 6. Formatting
-    new_features = ["hora_del_dia", "distancia_proyectada", "velocidad_tramo_m_s", "temperature_2m", "precipitation", "num_paradas_salto"]
-    features = ['trip_id', 'stop_id', 'stop_sequence', 'stop_lat', 'stop_lon', 'arrival_seconds'] + new_features
-    df = df[features + [TARGET]].copy()
+    # 3. Split trips chronologically — no trip crosses the boundary
+    df_train, df_test = split_trips_chronologically(df, train_frac=0.80)
+    del df
+    gc.collect()
 
-    continuous = ['stop_lat', 'stop_lon', 'arrival_seconds', TARGET] + new_features
-    for col in continuous:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce').astype("float32")
-    
-    df = df.dropna(subset=[TARGET]) 
-    logger.info(f"Final shape before split: {df.shape}")
+    # 4. TRAIN — build expanding-window O-D pairs and flush per k
+    historical_state: dict = {}
+    historical_state = run_split(df_train, "train", X_TRAIN_PARQUET, weather_df, historical_state)
+    del df_train
+    gc.collect()
 
-    # Categorical Types
-    for col in CATEGORICAL_FEATURES:
-        if col in df.columns:
-            df[col] = df[col].astype("category")
+    # Persist state so the test split inherits train's learned averages
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(STATE_FILE, "wb") as fh:
+        pickle.dump(historical_state, fh)
+    logger.info("  historical_state persisted: %d unique O-D pairs.", len(historical_state))
 
-    # 7. Train/Test Split
-    log_step("Performing Train/Test Split")
-    df = df.sort_values(by=['arrival_seconds'])
-    split_idx = int(len(df) * 0.8)
-    
-    train_df = df.iloc[:split_idx]
-    test_df = df.iloc[split_idx:]
+    # 5. TEST — continues accumulating from the train historical state
+    historical_state = run_split(df_test, "test", X_TEST_PARQUET, weather_df, historical_state)
+    del df_test
+    gc.collect()
 
-    # 8. Save as Parquet
-    log_step("Saving Parquet Files")
-    PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
-    
-    train_df.to_parquet(X_TRAIN_PARQUET, index=False)
-    test_df.to_parquet(X_TEST_PARQUET, index=False)
-    logger.info(f"Istanbul Preprocessing Complete! Train: {len(train_df)} rows, Test: {len(test_df)} rows.")
-    
-    total_time_minutes = (time.time() - script_start_time) / 60.0
-    log_step(f"Total Execution Time: {total_time_minutes:.2f} minutes")
+    elapsed = (time.time() - script_start) / 60.0
+    log_step(f"Istanbul Preprocessing Complete in {elapsed:.1f} minutes")
+
 
 if __name__ == "__main__":
     main()

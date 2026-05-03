@@ -37,8 +37,14 @@ else:
 MODEL_PATH = MODELS_DIR / MODEL_NAME
 
 # Parquet file paths (Processed)
-X_TRAIN_PARQUET = PROCESSED_DATA_DIR / "X_train_pro.parquet"
-X_TEST_PARQUET  = PROCESSED_DATA_DIR / "X_test_pro.parquet"
+# Sivas uses a single flat file. Boston and Istanbul use partitioned directories
+# (one part_k.parquet per lookahead horizon) to keep RAM bounded during ETL.
+if ACTIVE_DATASET == "sivas":
+    X_TRAIN_PARQUET = PROCESSED_DATA_DIR / "X_train_pro.parquet"
+    X_TEST_PARQUET  = PROCESSED_DATA_DIR / "X_test_pro.parquet"
+else:
+    X_TRAIN_PARQUET = PROCESSED_DATA_DIR / "X_train_pro"   # directory
+    X_TEST_PARQUET  = PROCESSED_DATA_DIR / "X_test_pro"    # directory
 
 # Global Constants from preprocess (can be moved here if needed)
 MAX_LOOKAHEAD_STOPS = 10
