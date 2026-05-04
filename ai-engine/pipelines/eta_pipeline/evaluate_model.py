@@ -29,6 +29,7 @@ Usage:
   ACTIVE_DATASET=boston python evaluate_model.py
 """
 
+import concurrent.futures
 import gc
 import logging
 import os
@@ -105,6 +106,12 @@ def load_model() -> xgb.XGBRegressor:
 
     model = xgb.XGBRegressor()
     model.load_model(str(MODEL_PATH))
+    
+    use_gpu = os.environ.get("USE_GPU", "False").lower() == "true"
+    if use_gpu:
+        model.set_param({"device": "cuda"})
+        logger.info("  GPU mode enabled for inference.")
+        
     size_mb = MODEL_PATH.stat().st_size / (1024 ** 2)
     logger.info("  Model loaded: %s (%.2f MB) | RAM: %.0f MB",
                 MODEL_PATH.name, size_mb, ram_mb())
@@ -173,12 +180,10 @@ def predict_chained(
     np.ndarray, shape (len(X),), dtype float64
         Summed predicted travel times in seconds.
     """
-    n_full   = k // MAX_LOOKAHEAD_STOPS
-    remainder = k %  MAX_LOOKAHEAD_STOPS
-
-    segment_sizes: list[int] = [MAX_LOOKAHEAD_STOPS] * n_full
-    if remainder > 0:
-        segment_sizes.append(remainder)
+    n_segments = (k + MAX_LOOKAHEAD_STOPS - 1) // MAX_LOOKAHEAD_STOPS
+    base = k // n_segments
+    remainder = k % n_segments
+    segment_sizes: list[int] = [base + 1] * remainder + [base] * (n_segments - remainder)
 
     total_pred = np.zeros(len(X), dtype=np.float64)
 
@@ -213,21 +218,74 @@ def predict_chained(
 # Chunked Evaluation  (Boston / Istanbul — partitioned directories)
 # ---------------------------------------------------------------------------
 
+def _process_partition(part_path: Path, model: xgb.XGBRegressor) -> dict | None:
+    try:
+        k = int(part_path.stem.split("_")[1])
+    except (IndexError, ValueError):
+        logger.warning("  Cannot parse k from filename %s — skipping.", part_path.name)
+        return None
+
+    t_load_start = time.time()
+    df = pd.read_parquet(part_path)
+    df = cast_types(df)
+    t_load = time.time() - t_load_start
+
+    n_rows = len(df)
+    if n_rows == 0:
+        return None
+
+    X = df.drop(columns=[TARGET])
+    y = df[TARGET].values.astype(np.float64)
+    del df
+    gc.collect()
+
+    t0 = time.time()
+    if k <= MAX_LOOKAHEAD_STOPS:
+        y_pred = model.predict(X).astype(np.float64)
+        infer_mode = "direct"
+    else:
+        logger.info(
+            "  k=%-2d | k > %d: applying chained inference.",
+            k, MAX_LOOKAHEAD_STOPS,
+        )
+        y_pred = predict_chained(model, X, k)
+        infer_mode = "chained"
+    t_infer = time.time() - t0
+
+    del X
+    gc.collect()
+
+    ae = np.abs(y - y_pred)
+    se = (y - y_pred) ** 2
+
+    res = {
+        "k": k,
+        "n_rows": n_rows,
+        "sum_ae": float(ae.sum()),
+        "sum_se": float(se.sum()),
+        "sum_y": float(y.sum()),
+        "sum_y2": float((y ** 2).sum()),
+        "sum_res2": float(se.sum()),
+        "t_load": t_load,
+        "t_infer": t_infer,
+        "infer_mode": infer_mode,
+        "mae": float(ae.mean()),
+        "rmse": float(np.sqrt(se.mean())),
+    }
+
+    del y, y_pred, ae, se
+    gc.collect()
+    return res
+
 def evaluate_partitioned(model: xgb.XGBRegressor, parquet_dir: Path) -> None:
     """
-    Iterate over sorted part_k.parquet files one at a time.
-
+    Iterate over sorted part_k.parquet files using concurrent.futures to parallelize.
+    
     RAM strategy
     ------------
-    - Load one partition -> infer -> accumulate scalars -> delete arrays.
-    - Never hold more than one partition in memory simultaneously.
-    - All global and per-k metrics are computed from running sums, not arrays.
-
-    Chaining
-    --------
-    Partitions with k <= MAX_LOOKAHEAD_STOPS: direct model.predict().
-    Partitions with k > MAX_LOOKAHEAD_STOPS: predict_chained() decomposes k
-    into sub-segments and sums the model's outputs.
+    - Max workers = 4 to keep concurrent memory footprint low.
+    - Asynchronous partitions yield a dictionary of running metrics.
+    - Main thread accumulates to compute final scalars safely.
     """
     log_step(f"STEP 2: CHUNKED INFERENCE over directory: {parquet_dir.name}")
 
@@ -239,7 +297,7 @@ def evaluate_partitioned(model: xgb.XGBRegressor, parquet_dir: Path) -> None:
         logger.error("No part_*.parquet files found in %s", parquet_dir)
         sys.exit(1)
 
-    logger.info("  Found %d partition files.", len(parquet_files))
+    logger.info("  Found %d partition files. Processing with max_workers=4...", len(parquet_files))
 
     # ------------------------------------------------------------------
     # Global running sums (no arrays stored)
@@ -258,74 +316,37 @@ def evaluate_partitioned(model: xgb.XGBRegressor, parquet_dir: Path) -> None:
     t_total_infer = 0.0
     t_total_load  = 0.0
 
-    for part_path in parquet_files:
-        # -----------------------------------------------------------------
-        # Extract k from filename: part_3.parquet -> 3, part_10.parquet -> 10
-        # -----------------------------------------------------------------
-        try:
-            k = int(part_path.stem.split("_")[1])
-        except (IndexError, ValueError):
-            logger.warning("  Cannot parse k from filename %s — skipping.", part_path.name)
-            continue
-
-        # -----------------------------------------------------------------
-        # Load partition
-        # -----------------------------------------------------------------
-        t_load_start = time.time()
-        df = pd.read_parquet(part_path)
-        df = cast_types(df)
-        t_total_load += time.time() - t_load_start
-
-        n_rows = len(df)
-        X = df.drop(columns=[TARGET])
-        y = df[TARGET].values.astype(np.float64)
-        del df
-        gc.collect()
-
-        # -----------------------------------------------------------------
-        # Inference: direct or chained
-        # -----------------------------------------------------------------
-        t0 = time.time()
-        if k <= MAX_LOOKAHEAD_STOPS:
-            y_pred = model.predict(X).astype(np.float64)
-            infer_mode = "direct"
-        else:
-            logger.info(
-                "  k=%-2d | k > %d: applying chained inference.",
-                k, MAX_LOOKAHEAD_STOPS,
-            )
-            y_pred = predict_chained(model, X, k)
-            infer_mode = "chained"
-        t_total_infer += time.time() - t0
-
-        del X
-        gc.collect()
-
-        # -----------------------------------------------------------------
-        # Compute partition metrics and accumulate
-        # -----------------------------------------------------------------
-        ae = np.abs(y - y_pred)
-        se = (y - y_pred) ** 2
-
-        total_n  += n_rows
-        sum_ae   += float(ae.sum())
-        sum_se   += float(se.sum())
-        sum_y    += float(y.sum())
-        sum_y2   += float((y ** 2).sum())
-        sum_res2 += float(se.sum())
-
-        if k not in k_stats:
-            k_stats[k] = {"n": 0, "sum_ae": 0.0, "sum_se": 0.0, "mode": infer_mode}
-        k_stats[k]["n"]      += n_rows
-        k_stats[k]["sum_ae"] += float(ae.sum())
-        k_stats[k]["sum_se"] += float(se.sum())
-
-        logger.info(
-            "  k=%-2d | %9s | %8d rows | MAE=%8.2f | RMSE=%8.2f | RAM: %.0f MB",
-            k, infer_mode, n_rows, ae.mean(), np.sqrt(se.mean()), ram_mb(),
-        )
-        del y, y_pred, ae, se
-        gc.collect()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        future_to_path = {executor.submit(_process_partition, p, model): p for p in parquet_files}
+        for future in concurrent.futures.as_completed(future_to_path):
+            part_path = future_to_path[future]
+            try:
+                res = future.result()
+                if res is None:
+                    continue
+                
+                k = res["k"]
+                total_n += res["n_rows"]
+                sum_ae += res["sum_ae"]
+                sum_se += res["sum_se"]
+                sum_y += res["sum_y"]
+                sum_y2 += res["sum_y2"]
+                sum_res2 += res["sum_res2"]
+                t_total_load += res["t_load"]
+                t_total_infer += res["t_infer"]
+                
+                if k not in k_stats:
+                    k_stats[k] = {"n": 0, "sum_ae": 0.0, "sum_se": 0.0, "mode": res["infer_mode"]}
+                k_stats[k]["n"]      += res["n_rows"]
+                k_stats[k]["sum_ae"] += res["sum_ae"]
+                k_stats[k]["sum_se"] += res["sum_se"]
+                
+                logger.info(
+                    "  k=%-2d | %9s | %8d rows | MAE=%8.2f | RMSE=%8.2f | RAM: %.0f MB",
+                    k, res["infer_mode"], res["n_rows"], res["mae"], res["rmse"], ram_mb()
+                )
+            except Exception as exc:
+                logger.error("Error processing partition %s: %s", part_path.name, exc)
 
     if total_n == 0:
         logger.error("No rows accumulated — check partition files.")

@@ -170,9 +170,10 @@ def engineer_base_features(df: pd.DataFrame, stops_df: pd.DataFrame, weather_df:
     df = df.sort_values(by=["arac_no", "cikis_zaman"]).reset_index(drop=True)
     arac_changed = df["arac_no"] != df["arac_no"].shift(1)
     route_changed = df["route_id"] != df["route_id"].shift(1)
-    time_gap = (df["cikis_zaman"] - df["varis_zaman"].shift(1)).dt.total_seconds() > (30 * 60)
+    time_gap = (df["cikis_zaman"] - df["varis_zaman"].shift(1)).dt.total_seconds() > (15 * 60)
+    spatial_break = df["stop_id_origen"] != df["stop_id_destino"].shift(1)
     
-    new_trip_mask = arac_changed | route_changed | time_gap
+    new_trip_mask = arac_changed | route_changed | time_gap | spatial_break
     df["trip_id"] = new_trip_mask.cumsum()
     logger.info(f"Reconstructed {df['trip_id'].nunique()} unique trips.")
     
