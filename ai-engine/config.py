@@ -19,20 +19,36 @@ PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Dataset-specific metadata
-if ACTIVE_DATASET == "boston":
-    TARGET = "tiempo_viaje_segundos"
-    CATEGORICAL_FEATURES = ["route_id", "direction_id", "stop_id_origen", "stop_id_destino"]
-    MODEL_NAME = "transit_xgboost_boston.ubj"
-elif ACTIVE_DATASET == "sivas":
-    TARGET = "delay_min"
-    CATEGORICAL_FEATURES = ["line_id", "stop_id", "traffic_level", "weather_condition"]
-    MODEL_NAME = "transit_xgboost_sivas.ubj"
-elif ACTIVE_DATASET == "istanbul":
-    TARGET = "travel_time_seconds"
-    CATEGORICAL_FEATURES = ["stop_id", "route_id", "direction_id"]
-    MODEL_NAME = "transit_xgboost_istanbul.ubj"
-else:
+DATASET_CONFIGS = {
+    "boston": {
+        "TARGET": "tiempo_viaje_segundos",
+        "CATEGORICAL_FEATURES": ["route_id", "direction_id", "stop_id_origen", "stop_id_destino"],
+        "MODEL_NAME": "transit_xgboost_boston.ubj"
+    },
+    "sivas": {
+        "TARGET": "delay_min",
+        "CATEGORICAL_FEATURES": ["line_id", "stop_id", "traffic_level", "weather_condition"],
+        "MODEL_NAME": "transit_xgboost_sivas.ubj"
+    },
+    "istanbul": {
+        "TARGET": "travel_time_seconds",
+        "CATEGORICAL_FEATURES": ["stop_id", "route_id", "direction_id"],
+        "MODEL_NAME": "transit_xgboost_istanbul.ubj"
+    },
+    "konya": {
+        "TARGET": "tiempo_viaje_segundos",
+        "CATEGORICAL_FEATURES": ["route_id", "stop_id_origen", "stop_id_destino"],
+        "MODEL_NAME": "transit_xgboost_konya.ubj"
+    }
+}
+
+if ACTIVE_DATASET not in DATASET_CONFIGS:
     raise ValueError(f"Unsupported ACTIVE_DATASET: {ACTIVE_DATASET}")
+
+cfg = DATASET_CONFIGS[ACTIVE_DATASET]
+TARGET = cfg["TARGET"]
+CATEGORICAL_FEATURES = cfg["CATEGORICAL_FEATURES"]
+MODEL_NAME = cfg["MODEL_NAME"]
 
 MODEL_PATH = MODELS_DIR / MODEL_NAME
 
