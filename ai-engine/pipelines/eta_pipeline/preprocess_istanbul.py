@@ -65,6 +65,8 @@ FINAL_COLS = [
     "temperature_2m",
     "precipitation",
     "stop_id",
+    "route_id",
+    "direction_id",
     "dest_stop_id",
     "stop_lat",
     "stop_lon",
@@ -73,6 +75,9 @@ FINAL_COLS = [
     "arrival_seconds",
     "distancia_proyectada",
     "velocidad_tramo_m_s",
+    "vel_lag_1",
+    "vel_lag_2",
+    "vel_lag_3",
     "num_paradas_salto",
     "tiempo_promedio_historico",
 ]
@@ -168,11 +173,13 @@ def fetch_istanbul_weather() -> pd.DataFrame:
 def load_and_prepare_base() -> pd.DataFrame:
     """
     Load stop_times.txt, interpolate missing arrival times, merge stop
-    coordinates, and clean coordinate columns.
+    coordinates and trips metadata (route_id, direction_id), and clean
+    coordinate columns.
     Returns a single base DataFrame sorted by (trip_id, stop_sequence).
     """
     stop_times_path = RAW_DATA_DIR / "gtfs_iett" / "stop_times" / "stop_times.txt"
     stops_path      = RAW_DATA_DIR / "gtfs_iett" / "stops.csv"
+    trips_path      = RAW_DATA_DIR / "gtfs_iett" / "trips.csv"
 
     log_step("STEP 1: Loading full stop_times.txt")
     logger.warning("  Source: %s", stop_times_path)
@@ -214,7 +221,72 @@ def load_and_prepare_base() -> pd.DataFrame:
     df.dropna(subset=["stop_lat", "stop_lon"], inplace=True)
     df["arrival_seconds"] = df["arrival_seconds"].astype("float32")
 
-    logger.info("  After merge + clean: %d rows | RAM: %.0f MB", len(df), ram_mb())
+    log_step("STEP 3b: Merging trips.csv (route_id, direction_id)")
+    trips = pd.read_csv(
+        trips_path,
+        sep=";",
+        usecols=["trip_id", "route_id", "direction_id"],
+        dtype={"trip_id": "category", "route_id": "category", "direction_id": "category"},
+    )
+    df = df.merge(trips, on="trip_id", how="left")
+    del trips; gc.collect()
+    logger.info(
+        "  After merge + clean: %d rows | route_id nulls: %d | RAM: %.0f MB",
+        len(df), df["route_id"].isna().sum(), ram_mb(),
+    )
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Speed Lags Engineering (mirrors Boston's engineer_base_and_speeds)
+# ---------------------------------------------------------------------------
+
+def engineer_base_and_speeds(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute per-stop speed from the previous stop (Haversine distance / elapsed
+    time) and derive vel_lag_1, vel_lag_2, vel_lag_3 by shifting within each
+    trip_id group.  Mirrors the Boston pipeline's engineer_base_and_speeds().
+
+    Expects df to be sorted by (trip_id, stop_sequence) — already guaranteed
+    by load_and_prepare_base().
+    """
+    log_step("STEP 3c: Speed Lag Engineering (vel_lag_1 / vel_lag_2 / vel_lag_3)")
+
+    grp = df.groupby("trip_id", sort=False, observed=True)
+
+    # Previous stop coordinates and arrival time (one position back within trip)
+    df["prev_lat"]     = grp["stop_lat"].shift(1)
+    df["prev_lon"]     = grp["stop_lon"].shift(1)
+    df["prev_actual"]  = grp["arrival_seconds"].shift(1)
+
+    # Haversine distance and elapsed time to compute instantaneous speed
+    dist_m = calc_haversine_vectorized(
+        df["stop_lat"], df["stop_lon"],
+        df["prev_lat"], df["prev_lon"],
+    )
+    time_s = (df["arrival_seconds"] - df["prev_actual"]).astype("float32")
+
+    df["vel_ms"] = (
+        (dist_m / time_s)
+        .replace([np.inf, -np.inf], np.nan)
+        .astype("float32")
+    )
+
+    # Lag features: shift vel_ms within each trip
+    df["vel_lag_1"] = grp["vel_ms"].shift(1).fillna(0.0).astype("float32")
+    df["vel_lag_2"] = grp["vel_ms"].shift(2).fillna(0.0).astype("float32")
+    df["vel_lag_3"] = grp["vel_ms"].shift(3).fillna(0.0).astype("float32")
+
+    df.drop(columns=["prev_lat", "prev_lon", "prev_actual", "vel_ms"], inplace=True)
+    gc.collect()
+
+    logger.info(
+        "  vel_lag_1 non-zero: %d | vel_lag_2: %d | vel_lag_3: %d | RAM: %.0f MB",
+        (df["vel_lag_1"] != 0).sum(),
+        (df["vel_lag_2"] != 0).sum(),
+        (df["vel_lag_3"] != 0).sum(),
+        ram_mb(),
+    )
     return df
 
 
@@ -289,7 +361,7 @@ def run_split(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Columns needed to look up destination rows after shift
-    dest_cols = ["trip_id", "stop_id", "stop_sequence", "arrival_seconds", "stop_lat", "stop_lon"]
+    dest_cols = ["trip_id", "stop_id", "stop_sequence", "arrival_seconds", "stop_lat", "stop_lon"]  # origin-side extras handled separately
     df_dest = df_split[dest_cols].copy()
 
     # Key for expanding window groupby (no route_id in GTFS-IETT)
@@ -311,7 +383,13 @@ def run_split(
 
         # --- Build chunk with origin + destination columns ---
         chunk = df_split.loc[
-            mask, ["trip_id", "stop_id", "stop_sequence", "arrival_seconds", "stop_lat", "stop_lon"]
+            mask,
+            [c for c in [
+                "trip_id", "stop_id", "stop_sequence", "arrival_seconds",
+                "stop_lat", "stop_lon",
+                "route_id", "direction_id",
+                "vel_lag_1", "vel_lag_2", "vel_lag_3",
+            ] if c in df_split.columns]
         ].copy()
 
         chunk["dest_stop_id"]         = df_shifted.loc[mask, "stop_id"].values
@@ -440,6 +518,9 @@ def main() -> None:
 
     # 1. Load and prepare the full base dataframe
     df = load_and_prepare_base()
+
+    # 1b. Compute speed lag features (vel_lag_1/2/3) — mirrors Boston pipeline
+    df = engineer_base_and_speeds(df)
 
     # 2. Fetch weather once (reused by both train and test splits)
     weather_df = fetch_istanbul_weather()

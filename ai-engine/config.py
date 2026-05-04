@@ -29,7 +29,7 @@ elif ACTIVE_DATASET == "sivas":
     MODEL_NAME = "transit_xgboost_sivas.ubj"
 elif ACTIVE_DATASET == "istanbul":
     TARGET = "travel_time_seconds"
-    CATEGORICAL_FEATURES = ["stop_id"]
+    CATEGORICAL_FEATURES = ["stop_id", "route_id", "direction_id"]
     MODEL_NAME = "transit_xgboost_istanbul.ubj"
 else:
     raise ValueError(f"Unsupported ACTIVE_DATASET: {ACTIVE_DATASET}")
