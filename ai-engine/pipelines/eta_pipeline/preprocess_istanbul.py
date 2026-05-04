@@ -343,6 +343,12 @@ def run_split(
     """
     Generate O-D pairs for one split (train or test).
 
+    For train: iterates k from 1 to MAX_LOOKAHEAD_STOPS (bounded horizon).
+    For test:  iterates k starting at 1 with a while-True loop that only
+               breaks when no more valid O-D pairs exist in the data,
+               allowing k > MAX_LOOKAHEAD_STOPS for long routes (needed by
+               the chained-inference evaluator).
+
     For each k-horizon:
       1. Shift destination rows by k positions.
       2. Apply trip-boundary and sequence-order masks.
@@ -353,7 +359,12 @@ def run_split(
 
     Returns the updated historical_state dictionary.
     """
-    log_step(f"STEP 5: O-D Expansion + Flush — {split_name.upper()} (k=1..{MAX_LOOKAHEAD_STOPS})")
+    is_test = split_name.lower() == "test"
+    k_limit_label = "unbounded" if is_test else str(MAX_LOOKAHEAD_STOPS)
+    log_step(
+        f"STEP 5: O-D Expansion + Flush — {split_name.upper()} "
+        f"(k=1..{k_limit_label})"
+    )
 
     # Clean and create output directory
     if out_dir.exists():
@@ -364,11 +375,23 @@ def run_split(
     dest_cols = ["trip_id", "stop_id", "stop_sequence", "arrival_seconds", "stop_lat", "stop_lon"]  # origin-side extras handled separately
     df_dest = df_split[dest_cols].copy()
 
-    # Key for expanding window groupby (no route_id in GTFS-IETT)
+    # Key for expanding window groupby
     pair_key = ["stop_id", "dest_stop_id"]
     total_rows = 0
 
-    for k in range(1, MAX_LOOKAHEAD_STOPS + 1):
+    # -----------------------------------------------------------------------
+    # Dynamic loop:
+    #   • train → bounded for-loop up to MAX_LOOKAHEAD_STOPS
+    #   • test  → unbounded while-True; breaks only when no O-D pairs remain
+    # -----------------------------------------------------------------------
+    k = 0
+    while True:
+        k += 1
+
+        # For train: stop after the model's training horizon
+        if not is_test and k > MAX_LOOKAHEAD_STOPS:
+            break
+
         df_shifted = df_dest.shift(-k)
 
         mask_trip = (df_split["trip_id"] == df_shifted["trip_id"]).fillna(False)
@@ -376,10 +399,20 @@ def run_split(
         mask      = mask_trip & mask_seq
 
         if not mask.any():
-            logger.info("  k=%-2d | No valid O-D pairs — skipping.", k)
-            del df_shifted
-            gc.collect()
-            continue
+            if is_test:
+                # No more physically-reachable O-D pairs — end of all routes
+                logger.info(
+                    "  k=%-2d | No valid O-D pairs — all routes exhausted. Stopping.",
+                    k,
+                )
+                del df_shifted
+                gc.collect()
+                break
+            else:
+                logger.info("  k=%-2d | No valid O-D pairs — skipping.", k)
+                del df_shifted
+                gc.collect()
+                continue
 
         # --- Build chunk with origin + destination columns ---
         chunk = df_split.loc[

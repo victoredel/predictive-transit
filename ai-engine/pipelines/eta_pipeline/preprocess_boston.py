@@ -275,118 +275,165 @@ def run_split(split: str, weather_df: pd.DataFrame, stops_df: pd.DataFrame) -> N
     for y in [2024, 2025]:
         holiday_dates.update(holidays.country_holidays("US", subdiv="MA", years=y).keys())
 
-    log_step(f"STEP 3-5: STREAMING SHIFT-JOIN TO PARQUET (Max Horizon: {MAX_LOOKAHEAD_STOPS})")
-    
+    is_test = split == "test"
+    k_limit_label = "unbounded" if is_test else str(MAX_LOOKAHEAD_STOPS)
+    log_step(
+        f"STEP 3-5: STREAMING SHIFT-JOIN TO PARQUET "
+        f"(split={split.upper()}, k=1..{k_limit_label})"
+    )
+
     cols_o = [
         "half_trip_id", "time_point_order", "stop_id", "actual",
         "stop_lat", "stop_lon", "route_id", "direction_id",
         "vel_lag_1", "vel_lag_2", "vel_lag_3"
     ]
-    
+
     cols_d = [
         "half_trip_id", "time_point_order", "stop_id", "actual",
         "stop_lat", "stop_lon"
     ]
-    
+
     df_dest = df[cols_d]
     total_filas = 0
     triplete = ['route_id', 'stop_id_origen', 'stop_id_destino']
 
-    for k in range(1, MAX_LOOKAHEAD_STOPS + 1):
+    # -----------------------------------------------------------------------
+    # Dynamic loop:
+    #   train -> bounded, capped at MAX_LOOKAHEAD_STOPS
+    #   test  -> unbounded while-True; breaks when no O-D pairs remain
+    # -----------------------------------------------------------------------
+    k = 0
+    while True:
+        k += 1
+
+        if not is_test and k > MAX_LOOKAHEAD_STOPS:
+            break
+
         df_d_shifted = df_dest.shift(-k)
 
-        mask_trip = (df["half_trip_id"] == df_d_shifted["half_trip_id"]).fillna(False)
-        mask_dir = (df_d_shifted["time_point_order"] > df["time_point_order"]).fillna(False)
-        mask_order = ((df_d_shifted["time_point_order"] - df["time_point_order"]) <= MAX_LOOKAHEAD_STOPS).fillna(False)
-        
-        mask = mask_trip & mask_dir & mask_order
+        mask_trip  = (df["half_trip_id"] == df_d_shifted["half_trip_id"]).fillna(False)
+        mask_dir   = (df_d_shifted["time_point_order"] > df["time_point_order"]).fillna(False)
 
-        if mask.any():
-            # Extract and rename only in validated partitions to save RAM
-            chunk_o = df.loc[mask, cols_o].rename(columns={
-                "time_point_order": "tpo_o", "stop_id": "stop_id_origen",
-                "actual": "actual_o", "stop_lat": "lat_o", "stop_lon": "lon_o"
-            }).reset_index(drop=True)
-            
-            chunk_d = df_d_shifted.loc[mask].drop(columns=["half_trip_id"]).rename(columns={
-                "time_point_order": "tpo_d", "stop_id": "stop_id_destino",
-                "actual": "actual_d", "stop_lat": "lat_d", "stop_lon": "lon_d"
-            }).reset_index(drop=True)
-            
-            chunk = pd.concat([chunk_o, chunk_d], axis=1)
-            
-            # --- Fast Feature Engineering (Inside the chunk) ---
-            chunk["tiempo_viaje_segundos"] = (chunk["actual_d"] - chunk["actual_o"]).dt.total_seconds().astype("float32")
-            chunk["distancia_proyectada"]  = calc_haversine_vectorized(chunk["lat_o"], chunk["lon_o"], chunk["lat_d"], chunk["lon_d"])
-            
-            # Clean outliers with reduced RAM footprint
-            mask_target = (chunk["tiempo_viaje_segundos"] > 0) & (chunk["tiempo_viaje_segundos"] <= MAX_TRAVEL_TIME_S)
-            chunk = chunk[mask_target].copy()
-            chunk.dropna(subset=["distancia_proyectada"], inplace=True)
-            
-            chunk["num_paradas_salto"] = (chunk["tpo_d"] - chunk["tpo_o"]).astype("float32")
-            
-            # ==== HISTORICAL AVERAGE TIME LOGIC (EXPANDING WINDOW) ====
-            # Sort strictly by time to avoid looking into the future
-            chunk.sort_values("actual_o", inplace=True)
-            
-            # 1. Retrieve the previous state from the global dictionary in a vectorized way
-            keys = list(zip(chunk['route_id'], chunk['stop_id_origen'], chunk['stop_id_destino']))
-            suma_previa = np.array([historical_state.get(ky, (0.0, 0))[0] for ky in keys])
-            conteo_previo = np.array([historical_state.get(ky, (0.0, 0))[1] for ky in keys])
-            
-            # 2. Cumulative internal sums of the current chunk (ignoring its own row: -tiempo)
-            suma_interna = chunk.groupby(triplete, observed=True)["tiempo_viaje_segundos"].cumsum() - chunk["tiempo_viaje_segundos"]
-            conteo_interna = chunk.groupby(triplete, observed=True).cumcount()
-            
-            # 3. Consolidate means and assign
-            total_sum = suma_previa + suma_interna.values
-            total_count = conteo_previo + conteo_interna.values
-            
-            default_val = chunk["distancia_proyectada"] / 5.0
-            denom = np.where(total_count == 0, 1, total_count)
-            tph = total_sum / denom
-            chunk["tiempo_promedio_historico"] = np.where(total_count == 0, default_val, tph).astype("float32")
-            
-            # 4. Update global state for future chunks or splits
-            chunk_aggs = chunk.groupby(triplete, observed=True)["tiempo_viaje_segundos"].agg(sum_val='sum', count_val='count').reset_index()
-            for row in chunk_aggs.itertuples(index=False):
-                idx = (row.route_id, row.stop_id_origen, row.stop_id_destino)
-                old_sum, old_count = historical_state.get(idx, (0.0, 0))
-                historical_state[idx] = (old_sum + row.sum_val, old_count + row.count_val)
-                
-            # ================================================================
-            
-            chunk["hora_del_dia"] = chunk["actual_o"].dt.hour.astype("Int8")
-            chunk["dia_semana"]   = chunk["actual_o"].dt.dayofweek.astype("Int8")
-            chunk["mes"]          = chunk["actual_o"].dt.month.astype("Int8")
-            chunk["hour_key"]     = chunk["actual_o"].dt.tz_convert("UTC").dt.floor("h")
-            chunk["is_holiday"]   = chunk["actual_o"].dt.date.isin(holiday_dates).astype("float32")
-            
-            if weather_df is not None and not weather_df.empty:
-                chunk = chunk.merge(weather_df, on="hour_key", how="left")
+        # For train: also enforce that the hop count stays within the model's
+        # training horizon so it never sees k > MAX_LOOKAHEAD_STOPS rows.
+        # For test: no upper cap — we need the full real-world horizon.
+        if not is_test:
+            mask_order = (
+                (df_d_shifted["time_point_order"] - df["time_point_order"]) <= MAX_LOOKAHEAD_STOPS
+            ).fillna(False)
+            mask = mask_trip & mask_dir & mask_order
+        else:
+            mask = mask_trip & mask_dir
+
+        if not mask.any():
+            if is_test:
+                logger.info(
+                    "  k=%-2d | No valid O-D pairs - all routes exhausted. Stopping.", k
+                )
+                del df_d_shifted
+                gc.collect()
+                break
             else:
-                chunk["temperature_2m"] = np.nan
-                chunk["precipitation"] = 0.0
-                chunk["snowfall"] = 0.0
-                
-            final_cols = [
-                "tiempo_viaje_segundos",
-                "hora_del_dia", "dia_semana", "mes",
-                "temperature_2m", "precipitation", "snowfall",
-                "is_holiday",
-                "route_id", "direction_id", "stop_id_origen", "stop_id_destino",
-                "distancia_proyectada",
-                "vel_lag_1", "vel_lag_2", "vel_lag_3",
-                "num_paradas_salto", "tiempo_promedio_historico"
-            ]
-            chunk = chunk[final_cols]
-            total_filas += len(chunk)
-            
-            # Export as partition using compressed engine
-            part_name = out_path / f"part_{k}.parquet"
-            chunk.to_parquet(part_name, index=False, compression="snappy")
-            logger.info("  Offset k=%-2d | Saved %8d rows to %s", k, len(chunk), part_name.name)
+                del df_d_shifted
+                gc.collect()
+                continue
+
+        # --- Extract and rename only in validated partitions to save RAM ---
+        chunk_o = df.loc[mask, cols_o].rename(columns={
+            "time_point_order": "tpo_o", "stop_id": "stop_id_origen",
+            "actual": "actual_o", "stop_lat": "lat_o", "stop_lon": "lon_o"
+        }).reset_index(drop=True)
+
+        chunk_d = df_d_shifted.loc[mask].drop(columns=["half_trip_id"]).rename(columns={
+            "time_point_order": "tpo_d", "stop_id": "stop_id_destino",
+            "actual": "actual_d", "stop_lat": "lat_d", "stop_lon": "lon_d"
+        }).reset_index(drop=True)
+
+        chunk = pd.concat([chunk_o, chunk_d], axis=1)
+
+        # --- Fast Feature Engineering ---
+        chunk["tiempo_viaje_segundos"] = (
+            (chunk["actual_d"] - chunk["actual_o"]).dt.total_seconds().astype("float32")
+        )
+        chunk["distancia_proyectada"] = calc_haversine_vectorized(
+            chunk["lat_o"], chunk["lon_o"], chunk["lat_d"], chunk["lon_d"]
+        )
+
+        # Clean outliers
+        mask_target = (
+            (chunk["tiempo_viaje_segundos"] > 0)
+            & (chunk["tiempo_viaje_segundos"] <= MAX_TRAVEL_TIME_S)
+        )
+        chunk = chunk[mask_target].copy()
+        chunk.dropna(subset=["distancia_proyectada"], inplace=True)
+
+        chunk["num_paradas_salto"] = (chunk["tpo_d"] - chunk["tpo_o"]).astype("float32")
+
+        # ==== HISTORICAL AVERAGE TIME LOGIC (EXPANDING WINDOW) ====
+        chunk.sort_values("actual_o", inplace=True)
+
+        keys = list(zip(chunk["route_id"], chunk["stop_id_origen"], chunk["stop_id_destino"]))
+        suma_previa   = np.array([historical_state.get(ky, (0.0, 0))[0] for ky in keys])
+        conteo_previo = np.array([historical_state.get(ky, (0.0, 0))[1] for ky in keys])
+
+        suma_interna   = (
+            chunk.groupby(triplete, observed=True)["tiempo_viaje_segundos"].cumsum()
+            - chunk["tiempo_viaje_segundos"]
+        )
+        conteo_interna = chunk.groupby(triplete, observed=True).cumcount()
+
+        total_sum   = suma_previa   + suma_interna.values
+        total_count = conteo_previo + conteo_interna.values
+
+        default_val = chunk["distancia_proyectada"] / 5.0
+        denom = np.where(total_count == 0, 1, total_count)
+        tph   = total_sum / denom
+        chunk["tiempo_promedio_historico"] = np.where(
+            total_count == 0, default_val, tph
+        ).astype("float32")
+
+        chunk_aggs = (
+            chunk.groupby(triplete, observed=True)["tiempo_viaje_segundos"]
+            .agg(sum_val="sum", count_val="count")
+            .reset_index()
+        )
+        for row in chunk_aggs.itertuples(index=False):
+            idx = (row.route_id, row.stop_id_origen, row.stop_id_destino)
+            old_sum, old_count = historical_state.get(idx, (0.0, 0))
+            historical_state[idx] = (old_sum + row.sum_val, old_count + row.count_val)
+        # ================================================================
+
+        chunk["hora_del_dia"] = chunk["actual_o"].dt.hour.astype("Int8")
+        chunk["dia_semana"]   = chunk["actual_o"].dt.dayofweek.astype("Int8")
+        chunk["mes"]          = chunk["actual_o"].dt.month.astype("Int8")
+        chunk["hour_key"]     = chunk["actual_o"].dt.tz_convert("UTC").dt.floor("h")
+        chunk["is_holiday"]   = chunk["actual_o"].dt.date.isin(holiday_dates).astype("float32")
+
+        if weather_df is not None and not weather_df.empty:
+            chunk = chunk.merge(weather_df, on="hour_key", how="left")
+        else:
+            chunk["temperature_2m"] = np.nan
+            chunk["precipitation"]  = 0.0
+            chunk["snowfall"]       = 0.0
+
+        final_cols = [
+            "tiempo_viaje_segundos",
+            "hora_del_dia", "dia_semana", "mes",
+            "temperature_2m", "precipitation", "snowfall",
+            "is_holiday",
+            "route_id", "direction_id", "stop_id_origen", "stop_id_destino",
+            "distancia_proyectada",
+            "vel_lag_1", "vel_lag_2", "vel_lag_3",
+            "num_paradas_salto", "tiempo_promedio_historico",
+        ]
+        chunk = chunk[final_cols]
+        total_filas += len(chunk)
+
+        part_name = out_path / f"part_{k}.parquet"
+        chunk.to_parquet(part_name, index=False, compression="snappy")
+        logger.info("  k=%-2d | Saved %8d rows to %s", k, len(chunk), part_name.name)
+        del chunk, chunk_o, chunk_d, chunk_aggs
+
 
         del df_d_shifted
         gc.collect()
