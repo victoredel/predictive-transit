@@ -146,6 +146,7 @@ def predict_chained(
     model: xgb.XGBRegressor,
     X: pd.DataFrame,
     k: int,
+    use_gpu: bool = False,
 ) -> np.ndarray:
     """
     Predict travel time for an O-D pair spanning k stops when k exceeds
@@ -174,6 +175,7 @@ def predict_chained(
     model   : loaded XGBRegressor (.ubj)
     X       : feature matrix for rows where num_paradas_salto == k
     k       : actual stop-horizon of these rows
+    use_gpu : bool, whether to use GPU inference via DMatrix
 
     Returns
     -------
@@ -202,7 +204,12 @@ def predict_chained(
                 X_seg["tiempo_promedio_historico"].astype(np.float32) * np.float32(scale)
             )
 
-        seg_pred = model.predict(X_seg).astype(np.float64)
+        if use_gpu:
+            dmatrix = xgb.DMatrix(X_seg, enable_categorical=True)
+            seg_pred = model.predict(dmatrix).astype(np.float64)
+        else:
+            seg_pred = model.predict(X_seg).astype(np.float64)
+            
         total_pred += seg_pred
         del X_seg
         gc.collect()
@@ -218,7 +225,7 @@ def predict_chained(
 # Chunked Evaluation  (Boston / Istanbul — partitioned directories)
 # ---------------------------------------------------------------------------
 
-def _process_partition(part_path: Path, model: xgb.XGBRegressor) -> dict | None:
+def _process_partition(part_path: Path, model: xgb.XGBRegressor, use_gpu: bool = False) -> dict | None:
     try:
         k = int(part_path.stem.split("_")[1])
     except (IndexError, ValueError):
@@ -241,14 +248,18 @@ def _process_partition(part_path: Path, model: xgb.XGBRegressor) -> dict | None:
 
     t0 = time.time()
     if k <= MAX_LOOKAHEAD_STOPS:
-        y_pred = model.predict(X).astype(np.float64)
+        if use_gpu:
+            dmatrix = xgb.DMatrix(X, enable_categorical=True)
+            y_pred = model.predict(dmatrix).astype(np.float64)
+        else:
+            y_pred = model.predict(X).astype(np.float64)
         infer_mode = "direct"
     else:
         logger.info(
             "  k=%-2d | k > %d: applying chained inference.",
             k, MAX_LOOKAHEAD_STOPS,
         )
-        y_pred = predict_chained(model, X, k)
+        y_pred = predict_chained(model, X, k, use_gpu)
         infer_mode = "chained"
     t_infer = time.time() - t0
 
@@ -316,12 +327,13 @@ def evaluate_partitioned(model: xgb.XGBRegressor, parquet_dir: Path) -> None:
     t_total_infer = 0.0
     t_total_load  = 0.0
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-        future_to_path = {executor.submit(_process_partition, p, model): p for p in parquet_files}
-        for future in concurrent.futures.as_completed(future_to_path):
-            part_path = future_to_path[future]
+    use_gpu = os.environ.get("USE_GPU", "False").lower() == "true"
+
+    if use_gpu:
+        logger.info("  GPU mode detected: Running sequential inference to avoid PCIe bottlenecks.")
+        for p in parquet_files:
             try:
-                res = future.result()
+                res = _process_partition(p, model, use_gpu=True)
                 if res is None:
                     continue
                 
@@ -346,7 +358,39 @@ def evaluate_partitioned(model: xgb.XGBRegressor, parquet_dir: Path) -> None:
                     k, res["infer_mode"], res["n_rows"], res["mae"], res["rmse"], ram_mb()
                 )
             except Exception as exc:
-                logger.error("Error processing partition %s: %s", part_path.name, exc)
+                logger.error("Error processing partition %s: %s", p.name, exc)
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            future_to_path = {executor.submit(_process_partition, p, model, use_gpu=False): p for p in parquet_files}
+            for future in concurrent.futures.as_completed(future_to_path):
+                part_path = future_to_path[future]
+                try:
+                    res = future.result()
+                    if res is None:
+                        continue
+                    
+                    k = res["k"]
+                    total_n += res["n_rows"]
+                    sum_ae += res["sum_ae"]
+                    sum_se += res["sum_se"]
+                    sum_y += res["sum_y"]
+                    sum_y2 += res["sum_y2"]
+                    sum_res2 += res["sum_res2"]
+                    t_total_load += res["t_load"]
+                    t_total_infer += res["t_infer"]
+                    
+                    if k not in k_stats:
+                        k_stats[k] = {"n": 0, "sum_ae": 0.0, "sum_se": 0.0, "mode": res["infer_mode"]}
+                    k_stats[k]["n"]      += res["n_rows"]
+                    k_stats[k]["sum_ae"] += res["sum_ae"]
+                    k_stats[k]["sum_se"] += res["sum_se"]
+                    
+                    logger.info(
+                        "  k=%-2d | %9s | %8d rows | MAE=%8.2f | RMSE=%8.2f | RAM: %.0f MB",
+                        k, res["infer_mode"], res["n_rows"], res["mae"], res["rmse"], ram_mb()
+                    )
+                except Exception as exc:
+                    logger.error("Error processing partition %s: %s", part_path.name, exc)
 
     if total_n == 0:
         logger.error("No rows accumulated — check partition files.")
