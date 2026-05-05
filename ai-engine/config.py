@@ -39,6 +39,11 @@ DATASET_CONFIGS = {
         "TARGET": "tiempo_viaje_segundos",
         "CATEGORICAL_FEATURES": ["route_id", "stop_id_origen", "stop_id_destino"],
         "MODEL_NAME": "transit_xgboost_konya.ubj"
+    },
+    "izmir": {
+        "TARGET": "tiempo_viaje_segundos",
+        "CATEGORICAL_FEATURES": ["route_id", "direction_id", "stop_id_origen", "stop_id_destino"],
+        "MODEL_NAME": "transit_xgboost_izmir.ubj"
     }
 }
 
