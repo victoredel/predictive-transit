@@ -73,8 +73,8 @@ else:
     X_TEST_PARQUET  = PROCESSED_DATA_DIR / "X_test_pro"    # directory
 
 # Global Constants from preprocess (can be moved here if needed)
-MAX_LOOKAHEAD_STOPS = 10
-MAX_TRAVEL_TIME_S   = 7200
+MAX_LOOKAHEAD_STOPS = 15
+MAX_TRAVEL_TIME_S   = 9000
 
 # ===========================================================================
 # Crowd Estimation Pipeline — Sivas dataset
