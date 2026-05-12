@@ -1,10 +1,22 @@
-"""
+﻿"""
 preprocess_toronto.py — Vectorized ETL and Feature Engineering for TTC (Toronto)
 =================================================================================
 Industrial-grade pipeline mirroring the Boston structure. Consumes raw GTFS-RT
 telemetry from the SQLite database produced by the ingestion layer, applies
 Downsampling and Spatial Snapping, then uses a vectorized Shift-Join to produce
 Origin-Destination pairs capped at a 10-stop lookahead horizon.
+
+Self-Contained Fallback
+-----------------------
+If the expected SQLite database (ttc_vehicle_positions.db) does not exist on
+disk — e.g. because the live ingestion module has been removed — the pipeline
+automatically invokes the private function `_generate_mock_telemetry()`.  This
+function reads the static GTFS schedule files already present in the Toronto raw
+directory (stop_times.txt, stops.txt, trips.txt), samples a subset of trips,
+expands them across a 30-day simulation window with Gaussian timestamp noise to
+mock real-world traffic delays, and writes the result to the expected SQLite
+path.  The main pipeline then loads this database and continues without any
+manual intervention.
 
 Usage:
   python preprocess_toronto.py --split train
@@ -53,7 +65,7 @@ logging.basicConfig(
 logger = logging.getLogger("preprocess_toronto")
 
 # ---------------------------------------------------------------------------
-# Constants
+# Constants — pipeline
 # ---------------------------------------------------------------------------
 BASE_DIR        = Path(__file__).parent
 DB_FILE         = RAW_DATA_DIR / "ttc_vehicle_positions.db"
@@ -75,6 +87,30 @@ RESAMPLE_FREQ   = "1min"
 
 # Source SQLite table written by ingest_ttc_gtfs_rt.py
 SOURCE_TABLE    = "raw_vehicle_positions"
+
+# ---------------------------------------------------------------------------
+# Constants — mock telemetry fallback
+# These values are only used when ttc_vehicle_positions.db is absent and the
+# pipeline needs to auto-generate a synthetic dataset from static GTFS files.
+# ---------------------------------------------------------------------------
+# Path to the static GTFS feed bundled with the Toronto raw dataset
+_GTFS_DIR            = RAW_DATA_DIR / "Complete GTFS"
+
+# Number of trip_ids to randomly sample (keeps generation fast)
+_MOCK_N_TRIPS        = 100
+
+# Seed for the NumPy random generator — guarantees reproducible output
+_MOCK_SEED           = 42
+
+# Simulation window: every sampled trip is replicated across this many days
+_MOCK_SIMULATION_DAYS = 30
+
+# Anchor date for the 30-day window (ISO format, America/Toronto tz applied)
+_MOCK_SIMULATION_START = "2025-01-01"
+
+# Gaussian noise parameters applied to each scheduled departure timestamp
+_MOCK_NOISE_MEAN_S   = 0.0    # unbiased — delays and early arrivals are symmetric
+_MOCK_NOISE_STD_S    = 90.0   # ±90 s standard deviation — realistic urban jitter
 
 # ---------------------------------------------------------------------------
 # Utility helpers
@@ -110,6 +146,262 @@ def vectorized_haversine(
     return (earth_radius_m * central_angle).astype("float32")
 
 
+def _gtfs_time_to_seconds(time_str: str) -> int:
+    """
+    Converts a GTFS departure_time string (HH:MM:SS) into total seconds past
+    midnight.  The GTFS spec allows service past midnight to be expressed as
+    hour values ≥ 24 (e.g. "25:10:00" means 01:10 the following day), so
+    standard datetime parsing would fail — this helper handles that correctly.
+
+    Examples
+    --------
+    >>> _gtfs_time_to_seconds("08:30:00")
+    30600
+    >>> _gtfs_time_to_seconds("25:05:00")
+    90300
+    """
+    parts = time_str.strip().split(":")
+    hours, minutes, seconds = int(parts[0]), int(parts[1]), int(parts[2])
+    return hours * 3_600 + minutes * 60 + seconds
+
+
+# ---------------------------------------------------------------------------
+# Mock-telemetry fallback — private, called only by load_raw_telemetry()
+# ---------------------------------------------------------------------------
+def _generate_mock_telemetry() -> None:
+    """
+    Generates a synthetic ``ttc_vehicle_positions.db`` from the static GTFS
+    schedule files that are already present in the Toronto raw directory.
+
+    This function is called automatically by ``load_raw_telemetry()`` when the
+    expected SQLite database does not exist on disk (e.g. because the live
+    GTFS-RT ingestion module has been removed from the project).  After this
+    function returns, the database is guaranteed to exist and the caller can
+    proceed with the normal preprocessing flow.
+
+    Algorithm
+    ---------
+    1. Validate that the three required GTFS files are present.
+    2. Load stop_times.txt, stops.txt, and trips.txt using column-selective
+       reads to minimise peak RAM usage.
+    3. Sample ``_MOCK_N_TRIPS`` trip IDs at random (seeded for reproducibility).
+    4. Filter stop_times to those trips, convert GTFS departure_time strings
+       (which may exceed 24:00:00) to integer seconds past midnight, and join
+       in stop coordinates and route/direction metadata.
+    5. Replicate each stop-visit across ``_MOCK_SIMULATION_DAYS`` calendar days
+       using NumPy broadcasting (no Python loops).
+    6. Apply Gaussian noise (mean=0, std=``_MOCK_NOISE_STD_S`` seconds) to
+       every timestamp to simulate real-world traffic-induced delays.
+    7. Write the resulting ping rows to the SQLite table ``raw_vehicle_positions``
+       at the path defined by ``DB_FILE``.
+    """
+    log_step("MOCK TELEMETRY FALLBACK: Generating synthetic ttc_vehicle_positions.db")
+    logger.warning(
+        "  ttc_vehicle_positions.db not found. "
+        "Auto-generating from static GTFS (n_trips=%d, days=%d, noise_std=%.0f s).",
+        _MOCK_N_TRIPS, _MOCK_SIMULATION_DAYS, _MOCK_NOISE_STD_S,
+    )
+
+    # ------------------------------------------------------------------
+    # Guard: all three GTFS source files must exist before proceeding.
+    # ------------------------------------------------------------------
+    for fname in ("stop_times.txt", "stops.txt", "trips.txt"):
+        fpath = _GTFS_DIR / fname
+        if not fpath.exists():
+            raise FileNotFoundError(
+                f"Cannot auto-generate mock telemetry: GTFS file missing: {fpath}\n"
+                "Ensure the Complete GTFS archive has been extracted under:\n"
+                f"  {_GTFS_DIR}"
+            )
+
+    rng = np.random.default_rng(_MOCK_SEED)
+    t_start = time.time()
+
+    # ------------------------------------------------------------------
+    # 1. Load GTFS source files (column-selective to minimise RAM)
+    # ------------------------------------------------------------------
+    logger.info("  [mock] Loading stop_times.txt …")
+    stop_times = pd.read_csv(
+        _GTFS_DIR / "stop_times.txt",
+        usecols=["trip_id", "stop_id", "stop_sequence", "departure_time"],
+        dtype={"trip_id": str, "stop_id": str, "departure_time": str},
+    )
+    logger.info("  [mock]   stop_times rows: %d", len(stop_times))
+
+    logger.info("  [mock] Loading stops.txt …")
+    stops = pd.read_csv(
+        _GTFS_DIR / "stops.txt",
+        usecols=["stop_id", "stop_lat", "stop_lon"],
+        dtype={"stop_id": str},
+    )
+    logger.info("  [mock]   stops rows: %d", len(stops))
+
+    logger.info("  [mock] Loading trips.txt …")
+    trips = pd.read_csv(
+        _GTFS_DIR / "trips.txt",
+        usecols=["trip_id", "route_id", "direction_id"],
+        dtype={"trip_id": str, "route_id": str},
+    )
+    logger.info("  [mock]   trips rows: %d", len(trips))
+
+    # ------------------------------------------------------------------
+    # 2. Sample trips and build the merged schedule table
+    # ------------------------------------------------------------------
+    all_trip_ids = stop_times["trip_id"].unique()
+    n_available  = len(all_trip_ids)
+
+    if _MOCK_N_TRIPS >= n_available:
+        logger.warning(
+            "  [mock] Requested n_trips=%d ≥ available (%d). Using all trips.",
+            _MOCK_N_TRIPS, n_available,
+        )
+        sampled_ids = all_trip_ids
+    else:
+        sampled_ids = rng.choice(all_trip_ids, size=_MOCK_N_TRIPS, replace=False)
+
+    logger.info(
+        "  [mock] Sampled %d trips from %d available.", len(sampled_ids), n_available
+    )
+
+    # Filter stop_times to sampled trips and parse GTFS departure_time strings
+    schedule = stop_times[stop_times["trip_id"].isin(sampled_ids)].copy()
+    logger.info("  [mock]   Stop-time rows for sampled trips: %d", len(schedule))
+
+    # Convert GTFS HH:MM:SS (possibly HH ≥ 24) → integer seconds past midnight
+    schedule["departure_time_s"] = schedule["departure_time"].apply(
+        _gtfs_time_to_seconds
+    )
+    schedule.drop(columns=["departure_time"], inplace=True)
+
+    # Free large source tables before joining
+    del stop_times
+
+    # Join stop coordinates
+    schedule = schedule.merge(stops, on="stop_id", how="left")
+    del stops
+
+    # Drop rows with missing coordinates (malformed GTFS entries)
+    missing_coords = schedule["stop_lat"].isna() | schedule["stop_lon"].isna()
+    if missing_coords.any():
+        logger.warning(
+            "  [mock]   Dropping %d rows with missing stop coordinates.",
+            missing_coords.sum(),
+        )
+        schedule = schedule[~missing_coords].copy()
+
+    # Join route_id and direction_id
+    schedule = schedule.merge(
+        trips[["trip_id", "route_id", "direction_id"]], on="trip_id", how="left"
+    )
+    del trips
+
+    # Conservatively default missing direction_id to "0" (inbound)
+    schedule["direction_id"] = (
+        schedule["direction_id"].fillna(0).astype(int).astype(str)
+    )
+    schedule.sort_values(["trip_id", "stop_sequence"], inplace=True)
+    schedule.reset_index(drop=True, inplace=True)
+    logger.info("  [mock]   Schedule rows after joining: %d", len(schedule))
+
+    # ------------------------------------------------------------------
+    # 3. Expand across the simulation window and apply Gaussian noise
+    # ------------------------------------------------------------------
+    base_epoch      = int(
+        pd.Timestamp(_MOCK_SIMULATION_START, tz=TIMEZONE).timestamp()
+    )
+    seconds_per_day = 86_400
+    n_rows          = len(schedule)
+    n_days          = _MOCK_SIMULATION_DAYS
+    total_pings     = n_rows * n_days
+
+    logger.info(
+        "  [mock] Expanding %d stop-visits × %d days with noise_std=%.0f s …",
+        n_rows, n_days, _MOCK_NOISE_STD_S,
+    )
+
+    # Build index and day-offset arrays via NumPy broadcasting (no Python loops)
+    row_indices = np.tile(np.arange(n_rows), n_days)    # shape: (total_pings,)
+    day_offsets = np.repeat(np.arange(n_days), n_rows)  # shape: (total_pings,)
+
+    departure_s     = schedule["departure_time_s"].values[row_indices]
+    base_timestamps = base_epoch + day_offsets * seconds_per_day + departure_s
+
+    # Gaussian noise: N(mean=0, std=_MOCK_NOISE_STD_S) seconds per ping
+    noise            = rng.normal(loc=_MOCK_NOISE_MEAN_S, scale=_MOCK_NOISE_STD_S,
+                                  size=total_pings)
+    noisy_timestamps = (base_timestamps + noise).astype(np.int64)
+
+    pings = pd.DataFrame({
+        # vehicle_id: use trip_id so each trip has one stable synthetic vehicle
+        "vehicle_id":      schedule["trip_id"].values[row_indices],
+        "route_id":        schedule["route_id"].values[row_indices],
+        "direction_id":    schedule["direction_id"].values[row_indices],
+        "current_stop_id": schedule["stop_id"].values[row_indices],
+        "current_lat":     schedule["stop_lat"].values[row_indices].astype(np.float32),
+        "current_lon":     schedule["stop_lon"].values[row_indices].astype(np.float32),
+        "timestamp":       noisy_timestamps,
+    })
+    del schedule
+
+    # Sort chronologically — mirrors what the real ingestion layer produces
+    pings.sort_values("timestamp", inplace=True)
+    pings.reset_index(drop=True, inplace=True)
+    logger.info("  [mock]   Generated %d pings.", len(pings))
+
+    # ------------------------------------------------------------------
+    # 4. Write to SQLite
+    # ------------------------------------------------------------------
+    DB_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    conn   = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    # Create the canonical table schema (matches the live ingestion schema)
+    cursor.execute(f"""
+        CREATE TABLE IF NOT EXISTS {SOURCE_TABLE} (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            vehicle_id      TEXT    NOT NULL,
+            route_id        TEXT,
+            direction_id    TEXT,
+            current_stop_id TEXT,
+            current_lat     REAL    NOT NULL,
+            current_lon     REAL    NOT NULL,
+            timestamp       INTEGER NOT NULL
+        )
+    """)
+
+    # Index on timestamp enables fast ORDER BY in load_raw_telemetry()
+    cursor.execute(
+        f"CREATE INDEX IF NOT EXISTS idx_{SOURCE_TABLE}_timestamp "
+        f"ON {SOURCE_TABLE} (timestamp ASC)"
+    )
+
+    # NOTE: SQLite caps bound parameters at 999 per statement, so method='multi'
+    # must NOT be used with wide rows.  The default single-row path is safe.
+    pings.to_sql(
+        SOURCE_TABLE,
+        conn,
+        if_exists="append",
+        index=False,
+        chunksize=10_000,
+    )
+    conn.commit()
+
+    row_count = cursor.execute(
+        f"SELECT COUNT(*) FROM {SOURCE_TABLE}"
+    ).fetchone()[0]
+    conn.close()
+    del pings
+    gc.collect()
+
+    elapsed = time.time() - t_start
+    logger.info(
+        "  [mock] SQLite database created in %.1f s — %d rows in '%s'.",
+        elapsed, row_count, SOURCE_TABLE,
+    )
+    logger.info("  [mock] DB path: %s", DB_FILE.resolve())
+
+
 # ---------------------------------------------------------------------------
 # Step 1 — Load raw telemetry from SQLite and perform chronological split
 # ---------------------------------------------------------------------------
@@ -122,10 +414,9 @@ def load_raw_telemetry(split_type: str) -> pd.DataFrame:
     log_step(f"STEP 1: RAW DATA LOADING — SPLIT={split_type.upper()}")
 
     if not DB_FILE.exists():
-        raise FileNotFoundError(
-            f"SQLite database not found: {DB_FILE}. "
-            "Run ingest_ttc_gtfs_rt.py (in ingestion/) first."
-        )
+        # The live ingestion module is not available — auto-generate a synthetic
+        # database from the static GTFS schedule files so the pipeline can run.
+        _generate_mock_telemetry()
 
     conn = sqlite3.connect(DB_FILE)
     df = pd.read_sql_query(
@@ -437,7 +728,7 @@ def run_shift_join(split_type: str, df: pd.DataFrame) -> None:
         partition_path = out_dir / f"part_{k}.parquet"
         chunk.to_parquet(partition_path, index=False, compression="snappy")
         logger.info(
-            "  k=%-2d | Written %8d rows → %s | RAM: %.0f MB",
+            "  k=%-2d | Written %8d rows -> %s | RAM: %.0f MB",
             k, len(chunk), partition_path.name, get_ram_mb(),
         )
 
@@ -501,3 +792,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
